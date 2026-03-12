@@ -2,8 +2,12 @@
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/SceneTexturesCommon.ush"
 
-
 float Strenght;
+float KStrength = 0.5f;
+float3 PaperColor = 1.0f;
+float Angle = 0.33f;
+float Scale = 3.0f;
+bool SuperSample = true;
 
 void MainVS(
 	in float4 InPosition : ATTRIBUTE0,
@@ -14,12 +18,131 @@ void MainVS(
 	DrawRectangle(InPosition, InTexCoord, OutPosition, OutUVAndScreenPos);
 }
 
+// Вспомогательная выборка цвета сцены
+float3 SampleSceneColor(float2 UV)
+{
+	float4 Scene = CalcSceneColorAndDepth(UV);
+	return Scene.rgb;
+}
+
+// ===== Адаптация функций из Halftone.fx =====
+
+float2x2 rotationMatrix(float angle)
+{
+	float s, c;
+	sincos(angle, s, c);
+	return float2x2(float2(c, -s), float2(s, c));
+}
+
+float2 scaledTexcoord(float2 texcoord, float angle, float scale, float2 aspect)
+{
+	float2x2 rot = rotationMatrix(angle);
+
+	float2 scaledTexcoord = mul(texcoord * aspect, rot);
+	scaledTexcoord = round(scaledTexcoord / scale) * scale;
+	scaledTexcoord = mul(scaledTexcoord, transpose(rot)) / aspect;
+
+	return scaledTexcoord;
+}
+
+float4 sRGBToCMYK(float3 sRGB)
+{
+	float4 cmyk;
+	cmyk.xyz = saturate(PaperColor - sRGB);
+	cmyk.w = (min(min(cmyk.x, cmyk.y), cmyk.z)) * KStrength;
+	cmyk.xyz = (PaperColor - sRGB - cmyk.w) / (1 - cmyk.w + 1e-5f);
+	return saturate(cmyk);
+}
+
+float coveragePercent(float2 dotCenter, float2 pixelCenter, float tonalValue, float scale, float2 aspect)
+{
+	// Точки сходятся примерно при 70% покрытия
+	float radius = (scale * tonalValue * 0.5f) / 0.7f;
+
+	float2 fromCenter = (pixelCenter - dotCenter) * aspect;
+	float dist = length(fromCenter);
+
+	float wd = fwidth(dist) * sqrt(0.5f);
+	return smoothstep(radius + wd, radius - wd, dist);
+}
+
+float4 CMYKSample(const float2 texcoord, const float scale, float2 aspect)
+{
+	float4 output = 0;
+	float2 coord;
+	float4 value;
+
+	// K (black)
+	coord = scaledTexcoord(texcoord.xy, 0.0f + Angle, scale, aspect);
+	value = sRGBToCMYK(SampleSceneColor(coord));
+	output.z = coveragePercent(coord, texcoord, value.z, scale, aspect);
+
+	// C
+	coord = scaledTexcoord(texcoord.xy, PI / 12.0f + Angle, scale, aspect);
+	value = sRGBToCMYK(SampleSceneColor(coord));
+	output.x = coveragePercent(coord, texcoord, value.x, scale, aspect);
+
+	// Y
+	coord = scaledTexcoord(texcoord.xy, PI / 4.0f + Angle, scale, aspect);
+	value = sRGBToCMYK(SampleSceneColor(coord));
+	output.w = coveragePercent(coord, texcoord, value.w, scale, aspect);
+
+	// M
+	coord = scaledTexcoord(texcoord.xy, (5.0f * PI) / 12.0f + Angle, scale, aspect);
+	value = sRGBToCMYK(SampleSceneColor(coord));
+	output.y = coveragePercent(coord, texcoord, value.y, scale, aspect);
+
+	return output;
+}
+
 float4 MainPS(
 	noperspective float4 UVAndScreenPos : TEXCOORD0
 	) : SV_Target0
 {
 	float2 uv = UVAndScreenPos.xy;
-    float4 res = CalcSceneColorAndDepth(uv);
-	
-    return saturate(float4(lerp(res.xyz, res.www*0.00001f, saturate(Strenght)), 1.f));
+
+	// Аналог BUFFER_WIDTH / HEIGHT через View.ViewSizeAndInvSize
+	float2 BufferSize = View.ViewSizeAndInvSize.xy;
+	float2 BufferInvSize = View.ViewSizeAndInvSize.zw;
+	float2 Aspect = float2(BufferSize.x / max(BufferSize.y, 1.0f), 1.0f);
+
+	// Масштаб точек (как в оригинале: 1 / (HEIGHT / Scale))
+	float scale = 1.0f / (BufferSize.y / max(Scale, 1.0f));
+
+	float4 output = 0.0f;
+
+	if (SuperSample)
+	{
+		[unroll]
+		for (int i = 1; i <= 2; i++)
+		{
+			[unroll]
+			for (int j = 1; j <= 2; j++)
+			{
+				float2 offset = (float2(i, j) / 3.0f) - 0.5f;
+				offset *= BufferInvSize;
+				output += CMYKSample(uv + offset, scale, Aspect);
+			}
+		}
+		output /= 4.0f;
+	}
+	else
+	{
+		output += CMYKSample(uv, scale, Aspect);
+	}
+
+	float3 sceneColor = SampleSceneColor(uv);
+	float4 value = sRGBToCMYK(sceneColor);
+
+	// Если K почти полностью закрашен – выключаем цветные точки
+	output.xyz = (output.w > 0.99f) ? 0.0f : output.xyz;
+
+	// Используем старый параметр Strenght (0–1) как силу эффекта
+	output = lerp(value, output, saturate(Strenght));
+
+	// Обратное преобразование из CMYK в RGB
+	float3 rgb = (1.0f - output.xyz) * (1.0f - output.w);
+	rgb = (rgb - (1.0f - PaperColor));
+
+	return float4(saturate(rgb), 1.0f);
 }
