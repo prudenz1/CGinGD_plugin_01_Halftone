@@ -13,14 +13,11 @@ void MainVS(
 	DrawRectangle(InPosition, InTexCoord, OutPosition, OutUVAndScreenPos);
 }
 
-// Вспомогательная выборка цвета сцены
 float3 SampleSceneColor(float2 UV)
 {
 	float4 Scene = CalcSceneColorAndDepth(UV);
 	return Scene.rgb;
 }
-
-// ===== Адаптация функций из Halftone.fx =====
 
 float2x2 rotationMatrix(float angle)
 {
@@ -42,7 +39,6 @@ float2 scaledTexcoord(float2 texcoord, float angle, float scale, float2 aspect)
 
 float4 sRGBToCMYK(float3 sRGB)
 {
-	// Локальные дефолтные настройки, чтобы не биндить их из кода движка
 	const float  LocalKStrength = 0.5f;
 	const float3 LocalPaperColor = 1.0f;
 
@@ -55,7 +51,6 @@ float4 sRGBToCMYK(float3 sRGB)
 
 float coveragePercent(float2 dotCenter, float2 pixelCenter, float tonalValue, float scale, float2 aspect)
 {
-	// Точки сходятся примерно при 70% покрытия
 	float radius = (scale * tonalValue * 0.5f) / 0.7f;
 
 	float2 fromCenter = (pixelCenter - dotCenter) * aspect;
@@ -67,29 +62,24 @@ float coveragePercent(float2 dotCenter, float2 pixelCenter, float tonalValue, fl
 
 float4 CMYKSample(const float2 texcoord, const float scale, float2 aspect)
 {
-	// Фиксированные настройки угла и масштаба узора
 	const float LocalAngle = 0.33f;
 
 	float4 output = 0;
 	float2 coord;
 	float4 value;
 
-	// K (black)
 	coord = scaledTexcoord(texcoord.xy, 0.0f + LocalAngle, scale, aspect);
 	value = sRGBToCMYK(SampleSceneColor(coord));
 	output.z = coveragePercent(coord, texcoord, value.z, scale, aspect);
 
-	// C
 	coord = scaledTexcoord(texcoord.xy, PI / 12.0f + LocalAngle, scale, aspect);
 	value = sRGBToCMYK(SampleSceneColor(coord));
 	output.x = coveragePercent(coord, texcoord, value.x, scale, aspect);
 
-	// Y
 	coord = scaledTexcoord(texcoord.xy, PI / 4.0f + LocalAngle, scale, aspect);
 	value = sRGBToCMYK(SampleSceneColor(coord));
 	output.w = coveragePercent(coord, texcoord, value.w, scale, aspect);
 
-	// M
 	coord = scaledTexcoord(texcoord.xy, (5.0f * PI) / 12.0f + LocalAngle, scale, aspect);
 	value = sRGBToCMYK(SampleSceneColor(coord));
 	output.y = coveragePercent(coord, texcoord, value.y, scale, aspect);
@@ -103,12 +93,10 @@ float4 MainPS(
 {
 	float2 uv = UVAndScreenPos.xy;
 
-	// Аналог BUFFER_WIDTH / HEIGHT через View.ViewSizeAndInvSize
 	float2 BufferSize = View.ViewSizeAndInvSize.xy;
 	float2 BufferInvSize = View.ViewSizeAndInvSize.zw;
 	float2 Aspect = float2(BufferSize.x / max(BufferSize.y, 1.0f), 1.0f);
 
-	// Масштаб точек (фиксированное значение, можно потом вынести в материал)
 	const float LocalScale = 3.0f;
 	const bool  LocalSuperSample = true;
 	float scale = 1.0f / (BufferSize.y / LocalScale);
@@ -138,13 +126,10 @@ float4 MainPS(
 	float3 sceneColor = SampleSceneColor(uv);
 	float4 value = sRGBToCMYK(sceneColor);
 
-	// Если K почти полностью закрашен – выключаем цветные точки
 	output.xyz = (output.w > 0.99f) ? 0.0f : output.xyz;
 
-	// Используем старый параметр Strenght (0–1) как силу эффекта
 	output = lerp(value, output, saturate(Strenght));
 
-	// Обратное преобразование из CMYK в RGB
 	const float3 LocalPaperColor = 1.0f;
 	float3 rgb = (1.0f - output.xyz) * (1.0f - output.w);
 	rgb = (rgb - (1.0f - LocalPaperColor));
