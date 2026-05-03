@@ -2,6 +2,18 @@
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/SceneTexturesCommon.ush"
 
+// 1 = исходный путь с 4x supersampling (качество)
+// 0 = оптимизированный путь: 1 проход + аналитический AA (производительность)
+#ifndef HALFTONE_QUALITY_SUPERSAMPLE
+	#define HALFTONE_QUALITY_SUPERSAMPLE 0
+#endif
+
+// Включает [branch] early-out для K-насыщенных (тёмных) зон:
+// пропускает выборки C/M/Y, если dot-coverage K уже >= порога.
+#ifndef HALFTONE_EARLY_OUT_K
+	#define HALFTONE_EARLY_OUT_K 1
+#endif
+
 float Strenght;
 
 void MainVS(
@@ -18,6 +30,8 @@ float3 SampleSceneColor(float2 UV)
 	float4 Scene = CalcSceneColorAndDepth(UV);
 	return Scene.rgb;
 }
+
+// ===== Адаптация функций из Halftone.fx =====
 
 float2x2 rotationMatrix(float angle)
 {
@@ -56,7 +70,12 @@ float coveragePercent(float2 dotCenter, float2 pixelCenter, float tonalValue, fl
 	float2 fromCenter = (pixelCenter - dotCenter) * aspect;
 	float dist = length(fromCenter);
 
+	// Расширенный AA-край (было sqrt(0.5) ≈ 0.707) — компенсирует отсутствие supersampling.
+#if HALFTONE_QUALITY_SUPERSAMPLE
 	float wd = fwidth(dist) * sqrt(0.5f);
+#else
+	float wd = fwidth(dist) * 1.0f;
+#endif
 	return smoothstep(radius + wd, radius - wd, dist);
 }
 
@@ -68,21 +87,34 @@ float4 CMYKSample(const float2 texcoord, const float scale, float2 aspect)
 	float2 coord;
 	float4 value;
 
-	coord = scaledTexcoord(texcoord.xy, 0.0f + LocalAngle, scale, aspect);
-	value = sRGBToCMYK(SampleSceneColor(coord));
-	output.z = coveragePercent(coord, texcoord, value.z, scale, aspect);
-
-	coord = scaledTexcoord(texcoord.xy, PI / 12.0f + LocalAngle, scale, aspect);
-	value = sRGBToCMYK(SampleSceneColor(coord));
-	output.x = coveragePercent(coord, texcoord, value.x, scale, aspect);
-
+	// K (чёрная сетка, угол PI/4) — считаем ПЕРВОЙ для возможности early-out.
+	// В исходном коде K-слот — это output.w (см. final маску output.w > 0.99).
 	coord = scaledTexcoord(texcoord.xy, PI / 4.0f + LocalAngle, scale, aspect);
 	value = sRGBToCMYK(SampleSceneColor(coord));
 	output.w = coveragePercent(coord, texcoord, value.w, scale, aspect);
 
-	coord = scaledTexcoord(texcoord.xy, (5.0f * PI) / 12.0f + LocalAngle, scale, aspect);
-	value = sRGBToCMYK(SampleSceneColor(coord));
-	output.y = coveragePercent(coord, texcoord, value.y, scale, aspect);
+#if HALFTONE_EARLY_OUT_K
+	// Если K уже почти полностью закрывает пиксель — C/M/Y всё равно занулятся
+	// маской ниже, значит их выборку можно пропустить целиком.
+	[branch]
+	if (output.w < 0.99f)
+#endif
+	{
+		// Y
+		coord = scaledTexcoord(texcoord.xy, 0.0f + LocalAngle, scale, aspect);
+		value = sRGBToCMYK(SampleSceneColor(coord));
+		output.z = coveragePercent(coord, texcoord, value.z, scale, aspect);
+
+		// C
+		coord = scaledTexcoord(texcoord.xy, PI / 12.0f + LocalAngle, scale, aspect);
+		value = sRGBToCMYK(SampleSceneColor(coord));
+		output.x = coveragePercent(coord, texcoord, value.x, scale, aspect);
+
+		// M
+		coord = scaledTexcoord(texcoord.xy, (5.0f * PI) / 12.0f + LocalAngle, scale, aspect);
+		value = sRGBToCMYK(SampleSceneColor(coord));
+		output.y = coveragePercent(coord, texcoord, value.y, scale, aspect);
+	}
 
 	return output;
 }
@@ -93,42 +125,47 @@ float4 MainPS(
 {
 	float2 uv = UVAndScreenPos.xy;
 
-	float2 BufferSize = View.ViewSizeAndInvSize.xy;
+	float2 BufferSize    = View.ViewSizeAndInvSize.xy;
 	float2 BufferInvSize = View.ViewSizeAndInvSize.zw;
 	float2 Aspect = float2(BufferSize.x / max(BufferSize.y, 1.0f), 1.0f);
 
 	const float LocalScale = 3.0f;
-	const bool  LocalSuperSample = true;
 	float scale = 1.0f / (BufferSize.y / LocalScale);
 
 	float4 output = 0.0f;
 
-	if (LocalSuperSample)
+#if HALFTONE_QUALITY_SUPERSAMPLE
+	// Исходный путь: 4 прохода с субпиксельным смещением (16 выборок сцены).
+	[unroll]
+	for (int i = 1; i <= 2; i++)
 	{
 		[unroll]
-		for (int i = 1; i <= 2; i++)
+		for (int j = 1; j <= 2; j++)
 		{
-			[unroll]
-			for (int j = 1; j <= 2; j++)
-			{
-				float2 offset = (float2(i, j) / 3.0f) - 0.5f;
-				offset *= BufferInvSize;
-				output += CMYKSample(uv + offset, scale, Aspect);
-			}
+			float2 offset = (float2(i, j) / 3.0f) - 0.5f;
+			offset *= BufferInvSize;
+			output += CMYKSample(uv + offset, scale, Aspect);
 		}
-		output /= 4.0f;
 	}
-	else
-	{
-		output += CMYKSample(uv, scale, Aspect);
-	}
-
-	float3 sceneColor = SampleSceneColor(uv);
-	float4 value = sRGBToCMYK(sceneColor);
+	output /= 4.0f;
+#else
+	// Оптимизированный путь: 1 проход, анти-алиасинг обеспечивается
+	// аналитическим smoothstep в coveragePercent (fwidth-based).
+	// Выборок сцены: ~4 вместо 16 (4× меньше).
+	output = CMYKSample(uv, scale, Aspect);
+#endif
 
 	output.xyz = (output.w > 0.99f) ? 0.0f : output.xyz;
 
-	output = lerp(value, output, saturate(Strenght));
+	// При Strenght≈1 базовый CMYK всё равно полностью перекрывается halftone'ом,
+	// поэтому финальный SampleSceneColor(uv) можно пропустить.
+	const float S = saturate(Strenght);
+	if (S < 0.999f)
+	{
+		float3 sceneColor = SampleSceneColor(uv);
+		float4 value = sRGBToCMYK(sceneColor);
+		output = lerp(value, output, S);
+	}
 
 	const float3 LocalPaperColor = 1.0f;
 	float3 rgb = (1.0f - output.xyz) * (1.0f - output.w);
